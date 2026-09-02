@@ -25,59 +25,176 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# ── Intel Core Ultra 5 225H Hardware Optimizations ──
+# Meteor Lake architecture features 4 Performance Cores (P-cores) + 8 Efficient Cores (E-cores).
+# Pinning thread pools to the 4 physical P-cores avoids thread migration and the "E-core straggler"
+# synchronization stall that degrades multi-threaded matrix operations on hybrid Intel CPUs.
+INTEL_CPU_THREADS = int(os.getenv("INTEL_CPU_THREADS", "4"))
+os.environ.setdefault("OMP_NUM_THREADS", str(INTEL_CPU_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(INTEL_CPU_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(INTEL_CPU_THREADS))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(INTEL_CPU_THREADS))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(INTEL_CPU_THREADS))
+os.environ.setdefault("KMP_BLOCKTIME", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 load_dotenv()
 
 # ── Offline AI Models ──
 import ollama
 import torch
-from transformers import pipeline
 
-OLLAMA_MODEL = "qwen2.5:7b"
+if hasattr(torch, "set_num_threads"):
+    torch.set_num_threads(INTEL_CPU_THREADS)
+if hasattr(torch, "set_num_interop_threads"):
+    torch.set_num_interop_threads(2)
+
+def resolve_ollama_model():
+    if os.getenv("OLLAMA_MODEL"):
+        return os.getenv("OLLAMA_MODEL")
+    try:
+        res = ollama.list()
+        names = [getattr(m, "model", str(m)) for m in getattr(res, "models", [])]
+        # On mobile CPUs, qwen2.5:3b delivers 25-35 tok/s vs 6-8 tok/s on 7b.
+        # Check for 3b first, then fallback to whatever is installed.
+        for candidate in ["qwen2.5:3b", "qwen2.5:7b", "qwen2.5:latest"]:
+            for name in names:
+                if name.startswith(candidate):
+                    return name
+    except Exception:
+        pass
+    return "qwen2.5:7b"
+
+OLLAMA_MODEL = resolve_ollama_model()
 FALLBACK_MODEL = "qwen2.5:7b"
-VISION_MODEL = "moondream"
+VISION_MODEL = os.getenv("VISION_MODEL", "moondream")
+print(f"🏥 Active Ollama Model: {OLLAMA_MODEL} (Vision: {VISION_MODEL})")
 
-# Load Whisper on CUDA GPU (int8_float16) for blazing-fast 0.5s speech transcription
-print("Loading Faster-Whisper on CUDA GPU (int8_float16)...")
-try:
-    from faster_whisper import WhisperModel
-    whisper_pipeline = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
-    print("✅ Whisper loaded on CUDA GPU (transcription latency: ~0.5s).")
-except Exception as e:
-    print(f"❌ Whisper failed: {e}")
-    whisper_pipeline = None
+import traceback
+
+_whisper_model = None
+_whisper_backend = None  # "faster_whisper" | "openai_whisper" | None
+
+def load_whisper_model(preferred_gpu_model="large-v3", cpu_model="small"):
+    global _whisper_model, _whisper_backend
+
+    if _whisper_model is not None:
+        return _whisper_model, _whisper_backend
+
+    # 1. Try faster_whisper on CUDA if NVIDIA GPU is present
+    try:
+        from faster_whisper import WhisperModel
+        if torch.cuda.is_available():
+            try:
+                print("Attempting to load faster-whisper (CUDA)...")
+                model = WhisperModel(preferred_gpu_model, device="cuda", compute_type="int8_float16")
+                _whisper_model = model
+                _whisper_backend = "faster_whisper"
+                print("✅ faster-whisper loaded on CUDA GPU.")
+                return _whisper_model, _whisper_backend
+            except Exception as e:
+                print("faster_whisper CUDA load failed:", e)
+
+        # 2. Intel Core Ultra CPU Optimization:
+        # CTranslate2 utilizes AVX-VNNI instructions for native INT8 matrix acceleration on CPU.
+        # Running with 4 threads matching physical P-cores avoids E-core latency penalties.
+        try:
+            print(f"Attempting to load faster-whisper on Intel CPU (model={cpu_model}, int8, {INTEL_CPU_THREADS} threads)...")
+            model = WhisperModel(
+                cpu_model,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=INTEL_CPU_THREADS,
+                num_workers=1
+            )
+            _whisper_model = model
+            _whisper_backend = "faster_whisper"
+            print(f"✅ faster-whisper loaded on Intel CPU (AVX-VNNI int8, model={cpu_model}).")
+            return _whisper_model, _whisper_backend
+        except Exception as e:
+            print("faster_whisper CPU load failed:", e)
+    except Exception as e:
+        print("faster_whisper not available:", e)
+
+    # 3. Fallback: openai-whisper (PyTorch CPU, pinned to P-cores)
+    try:
+        print(f"Attempting to load openai-whisper (CPU) model: {cpu_model}")
+        import whisper
+        torch.set_num_threads(INTEL_CPU_THREADS)
+        model = whisper.load_model(cpu_model, device="cpu")
+        _whisper_model = model
+        _whisper_backend = "openai_whisper"
+        print(f"✅ openai-whisper loaded on CPU (model={cpu_model}).")
+        return _whisper_model, _whisper_backend
+    except Exception as e:
+        print("openai-whisper failed to load:", e)
+        traceback.print_exc()
+
+    # Final fallback (no STT available)
+    _whisper_model = None
+    _whisper_backend = None
+    print("❌ No whisper backend loaded. Speech-to-text will be unavailable.")
+    return None, None
+
+
+def transcribe_file(audio_path, model_name_for_cpu="small", **kwargs):
+    """
+    Transcribe audio_path using the available backend.
+    Optimized for Intel Core Ultra CPU with greedy search (beam_size=1) and VAD filtering.
+    """
+    model, backend = load_whisper_model(cpu_model=model_name_for_cpu)
+    if model is None:
+        raise RuntimeError("No whisper model loaded; install faster-whisper or openai-whisper + dependencies.")
+
+    if backend == "faster_whisper":
+        transcribe_opts = {
+            "beam_size": 1,
+            "best_of": 1,
+            "vad_filter": True,
+            "vad_parameters": dict(min_silence_duration_ms=500, threshold=0.5),
+            "condition_on_previous_text": False,
+        }
+        transcribe_opts.update(kwargs)
+        segments, info = model.transcribe(audio_path, **transcribe_opts)
+        return " ".join([seg.text for seg in segments]).strip()
+    elif backend == "openai_whisper":
+        result = model.transcribe(audio_path, **kwargs)
+        return result.get("text", "").strip()
+    else:
+        raise RuntimeError("No whisper backend available.")
 
 
 # ── LLM Helpers ──
-def call_llm(prompt: str, image_bytes: Optional[bytes] = None) -> str:
-    """Call Ollama. If image_bytes provided, uses moondream."""
+def call_llm(prompt: str, image_bytes: Optional[bytes] = None, num_predict: Optional[int] = None) -> str:
+    """Call Ollama with Intel P-core thread allocation, low-latency context, and optional token cap."""
     messages = [{'role': 'user', 'content': prompt}]
     model = OLLAMA_MODEL
+
+    options = {
+        'temperature': 0.1,
+        'num_thread': INTEL_CPU_THREADS
+    }
+    if num_predict:
+        options['num_predict'] = num_predict
 
     if image_bytes:
         b64 = base64.b64encode(image_bytes).decode('utf-8')
         messages[0]['images'] = [b64]
         model = VISION_MODEL
+        options['num_ctx'] = 2048
         print(f"→ Ollama Vision ({model})...")
-        response = ollama.chat(model=model, messages=messages, format='json', options={
-            'num_ctx': 2048,
-            'temperature': 0.1
-        })
+        response = ollama.chat(model=model, messages=messages, format='json', options=options)
         return response['message']['content']
 
+    options['num_ctx'] = 4096
     print(f"→ Ollama ({model})...")
     try:
-        response = ollama.chat(model=model, messages=messages, format='json', options={
-            'num_ctx': 4096,       # 4k context takes only 250MB KV cache (prevents VRAM overflow)
-            'temperature': 0.1     
-        })
+        response = ollama.chat(model=model, messages=messages, format='json', options=options)
         return response['message']['content']
     except Exception as e:
         if model != FALLBACK_MODEL:
             print(f"⚠️ {model} not ready or failed ({e}), falling back to {FALLBACK_MODEL}...")
-            response = ollama.chat(model=FALLBACK_MODEL, messages=messages, format='json', options={
-                'num_ctx': 32768,
-                'temperature': 0.1
-            })
+            response = ollama.chat(model=FALLBACK_MODEL, messages=messages, format='json', options=options)
             return response['message']['content']
         raise e
 
@@ -335,7 +452,7 @@ TTS_LANG_MAP = {
 }
 
 @app.get("/api/tts")
-async def get_tts(text: str, lang: str = "hi"):
+def get_tts(text: str, lang: str = "hi"):
     """Text-to-speech with local audio caching for 100% offline playback."""
     if not text or not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
@@ -654,7 +771,7 @@ Output ONLY valid JSON:
 {HISTORY_FILTER_TEMPLATE}"""
 
         print(f"→ Running ABHA clinical relevance filter for '{chief_complaint}' on patient {patient.patient_id}...")
-        response_text = call_llm(prompt)
+        response_text = call_llm(prompt, num_predict=512)
         result_json = json.loads(extract_json_string(response_text))
         result_json = unwrap_json(result_json)
         
@@ -837,7 +954,7 @@ Output ONLY valid JSON:
 {PATIENT_JSON_TEMPLATE}"""
 
         print(f"→ Synthesizing full clinical record (dialogue + documents) for patient {patient.patient_id} in background...")
-        response_text = call_llm(prompt)
+        response_text = call_llm(prompt, num_predict=600)
         result_json = json.loads(extract_json_string(response_text))
         result_json = unwrap_json(result_json)
         ext = PatientExtraction(**result_json)
@@ -943,20 +1060,12 @@ async def process_audio(
         tmp_path = tmp.name
 
     lang_code = LANGUAGE_CODES.get(language, "en")
-    segments, info = whisper_pipeline.transcribe(
-        tmp_path, 
-        language=lang_code, 
-        beam_size=1,
-        best_of=1,
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            threshold=0.5
-        ),
-        initial_prompt="A clinical consultation in a hospital OPD. Symptoms, pain, fever, duration, past history.",
-        condition_on_previous_text=False
+    transcript = transcribe_file(
+        tmp_path,
+        model_name_for_cpu="small",
+        language=lang_code,
+        initial_prompt="A clinical consultation in a hospital OPD. Symptoms, pain, fever, duration, past history."
     )
-    transcript = " ".join([segment.text for segment in segments]).strip()
     os.remove(tmp_path)
     print(f"Transcript: {transcript}")
 
@@ -1122,20 +1231,14 @@ async def follow_up_audio(
         tmp_path = tmp.name
 
     lang_code = LANGUAGE_CODES.get(language, "en")
-    segments, info = whisper_pipeline.transcribe(
-        tmp_path, 
-        language=lang_code, 
-        beam_size=1,
-        best_of=1,
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            threshold=0.5
-        ),
-        initial_prompt="A clinical consultation in a hospital OPD. Symptoms, pain, fever, duration, past medical history.",
-        condition_on_previous_text=False
+    
+     # Use your custom wrapper that handles the CPU fallback
+    transcript = transcribe_file(
+        tmp_path,
+        model_name_for_cpu="small",
+        language=lang_code,
+        initial_prompt="A clinical consultation in a hospital OPD. Symptoms, pain, fever, duration, past history."
     )
-    transcript = " ".join([segment.text for segment in segments]).strip()
     os.remove(tmp_path)
     print(f"Follow-up transcript: {transcript}")
 
@@ -1310,6 +1413,14 @@ async def red_flag_check(patient_id: str, db: Session = Depends(get_db)):
     if not patient:
         return {"has_red_flags": False, "flags": [], "message": "Patient not found"}
 
+    # Fast path: If emergency was already detected during intake keywords, return immediately (0ms latency)
+    if patient.is_emergency:
+        return {
+            "has_red_flags": True,
+            "flags": [patient.chief_complaint or "Potential urgent symptoms"],
+            "message": "Immediate clinical attention recommended."
+        }
+
     prompt = f"""You are a medical triage safety system. Based on the patient's reported symptoms, identify any RED FLAG symptoms that may require urgent clinical assessment.
 
 Chief Complaint: {patient.chief_complaint}
@@ -1322,7 +1433,7 @@ Respond with JSON:
 IMPORTANT: Do NOT diagnose. Only flag potentially urgent symptoms. Be conservative — flag if uncertain."""
 
     try:
-        response_text = call_llm(prompt)
+        response_text = call_llm(prompt, num_predict=128)
         result = json.loads(extract_json_string(response_text))
         result = unwrap_json(result)
         return result
@@ -1350,7 +1461,7 @@ Common specialties: General Medicine, Cardiology, Pulmonology, Gastroenterology,
 IMPORTANT: The JSON keys must remain in English, but the VALUES for 'specialty' and 'reason' MUST be accurately translated into {language}. Do NOT diagnose. Only suggest which specialty is most appropriate for the described symptoms."""
 
     try:
-        response_text = call_llm(prompt)
+        response_text = call_llm(prompt, num_predict=128)
         result = json.loads(extract_json_string(response_text))
         result = unwrap_json(result)
         return result
