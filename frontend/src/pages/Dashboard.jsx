@@ -200,6 +200,11 @@ export default function Dashboard() {
               ⚠️ AI-GENERATED DRAFT — VERIFY BEFORE CLINICAL USE
             </div>
 
+            {/* AI Clinical Decision Support & Differential Diagnoses */}
+            {patientData.clinical_impression && (
+              <ClinicalImpressionCard impression={patientData.clinical_impression} patientData={patientData} />
+            )}
+
             {/* Cards Grid */}
             <div className="grid-2" style={{ gap: 'var(--space-4)', alignItems: 'start' }}>
 
@@ -472,6 +477,268 @@ function VisitCard({ visit, isRelevant }) {
           ⚠️ Flagged Labs: {visit.flagged_values.join(' • ')}
         </div>
       )}
+    </div>
+  );
+}
+
+function ClinicalImpressionCard({ impression, patientData }) {
+  const [isVerified, setIsVerified] = useState(false);
+  const [copiedTest, setCopiedTest] = useState(null);
+
+  if (!impression || (!impression.clinical_synthesis && (!impression.probable_diagnoses || impression.probable_diagnoses.length === 0))) {
+    return null;
+  }
+
+  const { clinical_synthesis, probable_diagnoses = [], suggested_investigations = [], critical_rule_outs = [] } = impression;
+
+  const handleCopyTest = (test) => {
+    navigator.clipboard?.writeText(test);
+    setCopiedTest(test);
+    setTimeout(() => setCopiedTest(null), 2000);
+  };
+
+  const getLikelihoodBadge = (likelihood) => {
+    const l = (likelihood || 'medium').toLowerCase();
+    if (l === 'high') {
+      return {
+        label: 'High Likelihood',
+        bg: 'rgba(239, 68, 68, 0.12)',
+        color: '#dc2626',
+        border: '1px solid rgba(239, 68, 68, 0.3)'
+      };
+    }
+    if (l === 'medium' || l === 'moderate') {
+      return {
+        label: 'Moderate Likelihood',
+        bg: 'rgba(245, 158, 11, 0.12)',
+        color: '#d97706',
+        border: '1px solid rgba(245, 158, 11, 0.3)'
+      };
+    }
+    return {
+      label: 'Low / Rule-Out',
+      bg: 'rgba(59, 130, 246, 0.12)',
+      color: '#2563eb',
+      border: '1px solid rgba(59, 130, 246, 0.3)'
+    };
+  };
+
+  return (
+    <div
+      className="card mb-6"
+      style={{
+        padding: 'var(--space-5)',
+        border: '1px solid rgba(59, 130, 246, 0.3)',
+        background: 'linear-gradient(180deg, rgba(239, 246, 255, 0.75) 0%, var(--color-surface) 100%)',
+        boxShadow: '0 4px 14px rgba(37, 99, 235, 0.08)',
+        borderRadius: 'var(--radius-lg, 12px)'
+      }}
+    >
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-3)', marginBottom: 'var(--space-4)', borderBottom: '1px solid rgba(59, 130, 246, 0.15)', paddingBottom: 'var(--space-3)' }}>
+        <div>
+          <div className="flex items-center gap-2 mb-1">
+            <span style={{ fontSize: '1.4rem' }}>🧠</span>
+            <h3 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 800, color: 'var(--color-text)', letterSpacing: '-0.01em' }}>
+              AI Clinical Decision Support & Differential Insights
+            </h3>
+            <span className="badge badge-info" style={{ fontSize: '11px', fontWeight: 700, padding: '3px 8px' }}>
+              CDSS v2.0
+            </span>
+          </div>
+          <p className="caption" style={{ color: 'var(--color-text-secondary)' }}>
+            Cross-modal synthesis of presenting symptoms, scanned lab reports, and verified ABHA health records
+          </p>
+        </div>
+
+        {/* Doctor Verification Control */}
+        <button
+          onClick={() => setIsVerified(!isVerified)}
+          className={`btn btn-sm ${isVerified ? 'btn-primary' : 'btn-outline'}`}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontWeight: 600, transition: 'all 0.2s ease' }}
+        >
+          {isVerified ? '✅ Verified by Doctor' : '👨‍⚕️ Click to Verify Impression'}
+        </button>
+      </div>
+
+      {/* Clinical Synthesis Executive Summary */}
+      {clinical_synthesis && (
+        <div
+          style={{
+            background: 'rgba(255, 255, 255, 0.92)',
+            borderLeft: '4px solid var(--color-primary)',
+            padding: 'var(--space-3) var(--space-4)',
+            borderRadius: '0 var(--radius-md) var(--radius-md) 0',
+            marginBottom: 'var(--space-4)',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
+          }}
+        >
+          <div className="flex items-center gap-1.5 mb-2">
+            <span style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', color: 'var(--color-primary)', letterSpacing: '0.05em' }}>
+              Clinical Synthesis Overview
+            </span>
+          </div>
+          <ul style={{ margin: 0, paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {(() => {
+              let points = [];
+              if (Array.isArray(clinical_synthesis)) {
+                points = clinical_synthesis.map(p => typeof p === 'string' ? p.replace(/^[•\-\*]\s*/, '').trim() : String(p));
+              } else if (typeof clinical_synthesis === 'string') {
+                const lines = clinical_synthesis.split(/\n+/).map(l => l.replace(/^[•\-\*]\s*/, '').trim()).filter(Boolean);
+                if (lines.length > 1) {
+                  points = lines;
+                } else {
+                  points = clinical_synthesis.split(/(?<=[.!?])\s+/).map(s => s.replace(/^[•\-\*]\s*/, '').trim()).filter(Boolean);
+                }
+              }
+              if (points.length === 0 && clinical_synthesis) {
+                points = [String(clinical_synthesis)];
+              }
+              return points.map((pt, pIdx) => (
+                <li key={pIdx} className="body-text" style={{ fontSize: '0.92rem', lineHeight: 1.45, color: 'var(--color-text)' }}>
+                  {pt}
+                </li>
+              ));
+            })()}
+          </ul>
+        </div>
+      )}
+
+      {/* Probable Diagnoses / Differentials */}
+      {probable_diagnoses.length > 0 && (
+        <div style={{ marginBottom: 'var(--space-4)' }}>
+          <h4 style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--color-text)', marginBottom: 'var(--space-3)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span>🎯</span> Probable Diagnoses & Clinical Evidence ({probable_diagnoses.length})
+          </h4>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 'var(--space-3)' }}>
+            {probable_diagnoses.map((diag, idx) => {
+              const badge = getLikelihoodBadge(diag.likelihood);
+              return (
+                <div
+                  key={idx}
+                  style={{
+                    background: 'var(--color-surface)',
+                    border: '1px solid var(--color-border)',
+                    borderRadius: 'var(--radius-md)',
+                    padding: 'var(--space-3) var(--space-4)',
+                    boxShadow: '0 2px 5px rgba(0,0,0,0.03)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'space-between'
+                  }}
+                >
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
+                      <span style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--color-text)' }}>
+                        {diag.condition}
+                      </span>
+                      <span
+                        style={{
+                          background: badge.bg,
+                          color: badge.color,
+                          border: badge.border,
+                          padding: '2px 8px',
+                          borderRadius: '12px',
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          whiteSpace: 'nowrap'
+                        }}
+                      >
+                        {badge.label}
+                      </span>
+                    </div>
+                    {diag.supporting_evidence && (
+                      <p className="caption" style={{ color: 'var(--color-text-secondary)', fontSize: '12px', lineHeight: 1.4 }}>
+                        <strong>💡 Evidence:</strong> {diag.supporting_evidence}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Two Column Footer: Suggested Investigations & Critical Rule-Outs */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 'var(--space-3)', paddingTop: 'var(--space-2)' }}>
+        
+        {/* Suggested Investigations */}
+        {suggested_investigations.length > 0 && (
+          <div
+            style={{
+              background: 'rgba(255, 255, 255, 0.7)',
+              border: '1px solid var(--color-border-light)',
+              borderRadius: 'var(--radius-md)',
+              padding: 'var(--space-3)'
+            }}
+          >
+            <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--color-text)', display: 'block', marginBottom: '8px' }}>
+              🧪 Suggested Diagnostic Workup:
+            </span>
+            <div className="flex flex-wrap gap-2">
+              {suggested_investigations.map((test, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => handleCopyTest(test)}
+                  title="Click to copy test name"
+                  style={{
+                    background: copiedTest === test ? 'var(--color-success-50, #d1fae5)' : 'var(--color-surface)',
+                    color: copiedTest === test ? 'var(--color-success-dark, #065f46)' : 'var(--color-primary)',
+                    border: '1px solid var(--color-border)',
+                    borderRadius: '6px',
+                    padding: '3px 10px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    transition: 'all 0.15s ease'
+                  }}
+                >
+                  <span>{copiedTest === test ? '✓' : '+'}</span> {test}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Critical Rule-Outs */}
+        {critical_rule_outs.length > 0 && (
+          <div
+            style={{
+              background: 'rgba(254, 242, 242, 0.75)',
+              border: '1px solid rgba(239, 68, 68, 0.2)',
+              borderRadius: 'var(--radius-md)',
+              padding: 'var(--space-3)'
+            }}
+          >
+            <span style={{ fontSize: '12px', fontWeight: 700, color: '#dc2626', display: 'block', marginBottom: '8px' }}>
+              ⚠️ Critical Rule-Outs (High-Risk Conditions):
+            </span>
+            <div className="flex flex-wrap gap-2">
+              {critical_rule_outs.map((ruleOut, idx) => (
+                <span
+                  key={idx}
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.1)',
+                    color: '#b91c1c',
+                    border: '1px solid rgba(239, 68, 68, 0.25)',
+                    borderRadius: '6px',
+                    padding: '3px 9px',
+                    fontSize: '12px',
+                    fontWeight: 600
+                  }}
+                >
+                  ⛔ {ruleOut}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+      </div>
     </div>
   );
 }
